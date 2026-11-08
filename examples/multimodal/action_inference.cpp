@@ -25,11 +25,13 @@
 #include "profiling/timer.h"
 #include "runtime/llmInferenceRuntime.h"
 #include "runtime/llmRuntimeUtils.h"
+#include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <getopt.h>
 #include <iostream>
 #include <nlohmann/json.hpp>
+#include <numeric>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -661,6 +663,8 @@ int main(int argc, char* argv[])
     // batchSize consecutive requests into one batched request, so downstream consumers
     // must receive the flat index, not the batch index.
     size_t flatRequestIdx = 0;
+    // Stage samples already attributed to earlier requests; gTimer only keeps cumulative lists.
+    std::unordered_map<std::string, size_t> stageRunsSeen;
 
     // Process each request with progress indication
     LOG_INFO("Processing %zu batched requests...", batchedRequests.size());
@@ -677,7 +681,27 @@ int main(int argc, char* argv[])
                 100.0 * (requestIdx + 1) / batchedRequests.size());
         }
 
+        // Images were decoded by parseInputFile, so this span starts from pixels in memory.
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        auto const requestStart = std::chrono::steady_clock::now();
         bool const requestStatus = llmInferenceRuntime->handleRequest(request, response, stream);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        double const requestLatencyMs
+            = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - requestStart).count();
+
+        Json requestStagesJson = Json::object();
+        if (profilerEnabled)
+        {
+            for (auto const& [stageId, timingData] : gTimer.getAllTimingData())
+            {
+                auto const& times = timingData.gpuTimesMs;
+                size_t& seen = stageRunsSeen[stageId];
+                requestStagesJson[stageId] = {{"runs", times.size() - seen},
+                    {"gpu_time_ms",
+                        std::accumulate(times.begin() + static_cast<std::ptrdiff_t>(seen), times.end(), 0.0)}};
+                seen = times.size();
+            }
+        }
 
         if (requestStatus)
         {
@@ -709,6 +733,9 @@ int main(int argc, char* argv[])
             responseJson["output_text"] = sanitizeUtf8ForJson(outputText);
             responseJson["request_idx"] = flatRequestIdx++;
             responseJson["batch_idx"] = batchIdx;
+            // Measured per batched request, so all responses of one batch share these.
+            responseJson["latency_ms"] = requestLatencyMs;
+            responseJson["stages"] = requestStagesJson;
             // Store messages for reference
             nlohmann::json messagesJson = nlohmann::json::array();
             for (auto const& msg : request.requests[batchIdx].messages)
