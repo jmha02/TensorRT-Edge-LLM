@@ -197,8 +197,15 @@ Hash128 hashOpaqueIdentity(std::string_view bytes, cudaStream_t stream, bool cpu
     if (prop.integrated)
     {
         // Unified memory: GPU can read host memory directly via mapped pointer.
-        if (cudaHostRegister(
-                const_cast<void*>(static_cast<void const*>(bytes.data())), totalSize, cudaHostRegisterMapped)
+        cudaPointerAttributes attributes{};
+        if (cudaPointerGetAttributes(&attributes, bytes.data()) == cudaSuccess
+            && attributes.type == cudaMemoryTypeHost && attributes.devicePointer != nullptr)
+        {
+            // Already pinned (CPU rt::Tensor uses cudaMallocHost), which cudaHostRegister rejects.
+            gpuReadPtr = static_cast<uint8_t const*>(attributes.devicePointer);
+        }
+        else if (cudaHostRegister(
+                     const_cast<void*>(static_cast<void const*>(bytes.data())), totalSize, cudaHostRegisterMapped)
             == cudaSuccess)
         {
             void* devicePtr = nullptr;
@@ -212,6 +219,11 @@ Hash128 hashOpaqueIdentity(std::string_view bytes, cudaStream_t stream, bool cpu
             {
                 cudaHostUnregister(const_cast<void*>(static_cast<void const*>(bytes.data())));
             }
+        }
+        if (gpuReadPtr == nullptr)
+        {
+            // Clear the error a failed call above leaves pending; launchErr below would read it.
+            static_cast<void>(cudaGetLastError());
         }
     }
 
